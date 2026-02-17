@@ -15,7 +15,7 @@ use {
 use {
     moltis_agents::tool_registry::AgentTool,
     moltis_config::schema::{
-        PerplexityConfig, SearchProvider as ConfigSearchProvider, WebSearchConfig,
+        PerplexityConfig, SearchProvider as ConfigSearchProvider, SerperConfig, WebSearchConfig,
     },
 };
 
@@ -25,7 +25,7 @@ struct CacheEntry {
     expires_at: Instant,
 }
 
-/// Web search tool — lets the LLM search the web via Brave Search or Perplexity.
+/// Web search tool — lets the LLM search the web via Brave Search, Perplexity, or Serper.
 ///
 /// When the configured provider's API key is missing, the tool automatically
 /// falls back to DuckDuckGo HTML search so the LLM never has to ask the user.
@@ -49,6 +49,7 @@ pub struct WebSearchTool {
 enum SearchProvider {
     Brave,
     Perplexity { base_url: String, model: String },
+    Serper { base_url: String },
 }
 
 fn env_value_with_overrides(env_overrides: &HashMap<String, String>, key: &str) -> Option<String> {
@@ -110,6 +111,21 @@ struct PerplexityMessage {
     content: String,
 }
 
+/// Serper.dev API search response (subset).
+#[derive(Debug, Deserialize)]
+struct SerperResponse {
+    #[serde(default)]
+    organic: Vec<SerperOrganicResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SerperOrganicResult {
+    title: String,
+    link: String,
+    #[serde(default)]
+    snippet: String,
+}
+
 impl WebSearchTool {
     /// Build from config; returns `None` if disabled or no API key available.
     pub fn from_config(config: &WebSearchConfig) -> Option<Self> {
@@ -153,6 +169,17 @@ impl WebSearchTool {
                     .unwrap_or_else(|| "perplexity/sonar-pro".into());
                 Some(Self::new(
                     SearchProvider::Perplexity { base_url, model },
+                    api_key,
+                    config.max_results,
+                    Duration::from_secs(config.timeout_seconds),
+                    Duration::from_secs(config.cache_ttl_minutes * 60),
+                    true,
+                ))
+            },
+            ConfigSearchProvider::Serper => {
+                let (api_key, base_url) = resolve_serper_config(&config.serper, env_overrides);
+                Some(Self::new(
+                    SearchProvider::Serper { base_url },
                     api_key,
                     config.max_results,
                     Duration::from_secs(config.timeout_seconds),
@@ -338,6 +365,64 @@ impl WebSearchTool {
         }))
     }
 
+    /// Search via Serper.dev (Google Search API).
+    async fn search_serper(
+        &self,
+        query: &str,
+        count: u8,
+        base_url: &str,
+    ) -> Result<serde_json::Value> {
+        if self.api_key.expose_secret().is_empty() {
+            return Ok(serde_json::json!({
+                "error": "Serper API key not configured",
+                "hint": "Set SERPER_API_KEY environment variable or tools.web.search.serper.api_key in config"
+            }));
+        }
+
+        let client = reqwest::Client::builder().timeout(self.timeout).build()?;
+
+        let body = serde_json::json!({
+            "q": query,
+            "num": count,
+        });
+
+        let resp = client
+            .post(format!("{base_url}/search"))
+            .header(
+                "X-API-KEY",
+                self.api_key.expose_secret().as_str(),
+            )
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            bail!("Serper API returned {status}: {text}");
+        }
+
+        let serper: SerperResponse = resp.json().await?;
+        let results: Vec<serde_json::Value> = serper
+            .organic
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "title": r.title,
+                    "url": r.link,
+                    "description": r.snippet,
+                })
+            })
+            .collect();
+
+        Ok(serde_json::json!({
+            "provider": "serper",
+            "query": query,
+            "results": results,
+        }))
+    }
+
     /// Check whether DuckDuckGo is temporarily blocked due to a prior CAPTCHA.
     fn is_ddg_blocked(&self) -> bool {
         self.ddg_blocked_until
@@ -360,7 +445,7 @@ impl WebSearchTool {
         if self.is_ddg_blocked() {
             bail!(
                 "Web search unavailable: DuckDuckGo is rate-limited (CAPTCHA) and no search \
-                 API key is configured. Set BRAVE_API_KEY or PERPLEXITY_API_KEY to enable search."
+                 API key is configured. Set BRAVE_API_KEY, PERPLEXITY_API_KEY, or SERPER_API_KEY to enable search."
             );
         }
 
@@ -387,7 +472,7 @@ impl WebSearchTool {
             warn!("DuckDuckGo CAPTCHA detected — blocking fallback for 1 hour");
             bail!(
                 "Web search unavailable: DuckDuckGo returned a CAPTCHA challenge. \
-                 Configure BRAVE_API_KEY or PERPLEXITY_API_KEY for reliable search."
+                 Configure BRAVE_API_KEY, PERPLEXITY_API_KEY, or SERPER_API_KEY for reliable search."
             );
         }
 
@@ -423,6 +508,26 @@ fn resolve_perplexity_config(
             "https://openrouter.ai/api/v1".into()
         }
     });
+
+    (Secret::new(api_key), base_url)
+}
+
+/// Resolve Serper API key and base URL from config / env.
+fn resolve_serper_config(
+    cfg: &SerperConfig,
+    env_overrides: &HashMap<String, String>,
+) -> (Secret<String>, String) {
+    let api_key = cfg
+        .api_key
+        .as_ref()
+        .map(|s| s.expose_secret().clone())
+        .or_else(|| env_value_with_overrides(env_overrides, "SERPER_API_KEY"))
+        .unwrap_or_default();
+
+    let base_url = cfg
+        .base_url
+        .clone()
+        .unwrap_or_else(|| "https://google.serper.dev".into());
 
     (Secret::new(api_key), base_url)
 }
@@ -506,14 +611,14 @@ fn strip_tags(s: &str) -> String {
 
 /// Decode common HTML entities.
 fn decode_html_entities(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&apos;", "'")
-        .replace("&nbsp;", " ")
-        .replace("&#160;", " ")
+    s.replace("\u{0026}amp;", "\u{0026}")
+        .replace("\u{0026}lt;", "\u{003C}")
+        .replace("\u{0026}gt;", "\u{003E}")
+        .replace("\u{0026}quot;", "\u{0022}")
+        .replace("\u{0026}#39;", "\u{0027}")
+        .replace("\u{0026}apos;", "\u{0027}")
+        .replace("\u{0026}nbsp;", " ")
+        .replace("\u{0026}#160;", " ")
 }
 
 /// Resolve a DuckDuckGo redirect URL (`//duckduckgo.com/l/?uddg=...`) to the
@@ -645,6 +750,9 @@ impl AgentTool for WebSearchTool {
                 SearchProvider::Perplexity { base_url, model } => {
                     self.search_perplexity(query, base_url, model).await?
                 },
+                SearchProvider::Serper { base_url } => {
+                    self.search_serper(query, count, base_url).await?
+                },
             }
         };
 
@@ -674,6 +782,19 @@ mod tests {
             SearchProvider::Perplexity {
                 base_url: "https://api.perplexity.ai".into(),
                 model: "sonar-pro".into(),
+            },
+            Secret::new(String::new()),
+            5,
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            false, // no network fallback in tests
+        )
+    }
+
+    fn serper_tool() -> WebSearchTool {
+        WebSearchTool::new(
+            SearchProvider::Serper {
+                base_url: "https://google.serper.dev".into(),
             },
             Secret::new(String::new()),
             5,
@@ -724,6 +845,17 @@ mod tests {
                 .unwrap()
                 .contains("PERPLEXITY_API_KEY")
         );
+    }
+
+    #[tokio::test]
+    async fn test_serper_missing_api_key_returns_hint() {
+        let tool = serper_tool();
+        let result = tool
+            .execute(serde_json::json!({"query": "test"}))
+            .await
+            .unwrap();
+        assert!(result["error"].as_str().unwrap().contains("not configured"));
+        assert!(result["hint"].as_str().unwrap().contains("SERPER_API_KEY"));
     }
 
     #[test]
@@ -786,6 +918,20 @@ mod tests {
     }
 
     #[test]
+    fn test_serper_response_parsing() {
+        let json = serde_json::json!({
+            "organic": [
+                {"title": "Rust", "link": "https://rust-lang.org", "snippet": "A language"},
+                {"title": "Crates", "link": "https://crates.io", "snippet": "Packages"}
+            ]
+        });
+        let resp: SerperResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(resp.organic.len(), 2);
+        assert_eq!(resp.organic[0].title, "Rust");
+        assert_eq!(resp.organic[0].link, "https://rust-lang.org");
+    }
+
+    #[test]
     fn test_resolve_perplexity_config_pplx_prefix() {
         let cfg = PerplexityConfig {
             api_key: Some(Secret::new("pplx-abc123".to_string())),
@@ -807,6 +953,25 @@ mod tests {
         let (key, url) = resolve_perplexity_config(&cfg, &HashMap::new());
         assert_eq!(key.expose_secret(), "sk-or-abc123");
         assert!(url.contains("openrouter.ai"));
+    }
+
+    #[test]
+    fn test_resolve_serper_config() {
+        let cfg = SerperConfig {
+            api_key: Some(Secret::new("test-key".to_string())),
+            base_url: Some("https://custom.serper.dev".into()),
+        };
+        let (key, url) = resolve_serper_config(&cfg, &HashMap::new());
+        assert_eq!(key.expose_secret(), "test-key");
+        assert_eq!(url, "https://custom.serper.dev");
+    }
+
+    #[test]
+    fn test_resolve_serper_config_defaults() {
+        let cfg = SerperConfig::default();
+        let (key, url) = resolve_serper_config(&cfg, &HashMap::new());
+        assert!(key.expose_secret().is_empty());
+        assert_eq!(url, "https://google.serper.dev");
     }
 
     #[test]
@@ -836,11 +1001,11 @@ mod tests {
     fn test_parse_duckduckgo_html_basic() {
         let html = r#"
         <div class="web-result">
-          <h2><a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Frust-lang.org&amp;rut=abc" class="result__a">Rust Programming Language</a></h2>
+          <h2><a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Frust-lang.org&rut=abc" class="result__a">Rust Programming Language</a></h2>
           <a class="result__snippet">A language empowering everyone to build reliable software.</a>
         </div>
         <div class="web-result">
-          <h2><a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fcrates.io&amp;rut=def" class="result__a">crates.io: Rust Package Registry</a></h2>
+          <h2><a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fcrates.io&rut=def" class="result__a">crates.io: Rust Package Registry</a></h2>
           <a class="result__snippet">The Rust community's package registry.</a>
         </div>
         "#;
@@ -860,15 +1025,15 @@ mod tests {
     fn test_parse_duckduckgo_html_respects_max() {
         let html = r#"
         <div class="web-result">
-          <h2><a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fa.com&amp;rut=1" class="result__a">A</a></h2>
+          <h2><a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fa.com&rut=1" class="result__a">A</a></h2>
           <a class="result__snippet">Desc A</a>
         </div>
         <div class="web-result">
-          <h2><a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fb.com&amp;rut=2" class="result__a">B</a></h2>
+          <h2><a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fb.com&rut=2" class="result__a">B</a></h2>
           <a class="result__snippet">Desc B</a>
         </div>
         <div class="web-result">
-          <h2><a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fc.com&amp;rut=3" class="result__a">C</a></h2>
+          <h2><a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fc.com&rut=3" class="result__a">C</a></h2>
           <a class="result__snippet">Desc C</a>
         </div>
         "#;
@@ -886,8 +1051,8 @@ mod tests {
     fn test_parse_duckduckgo_html_with_entities() {
         let html = r#"
         <div class="web-result">
-          <h2><a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com&amp;rut=x" class="result__a">Tom &amp; Jerry</a></h2>
-          <a class="result__snippet">A &lt;classic&gt; show</a>
+          <h2><a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com&rut=x" class="result__a">Tom & Jerry</a></h2>
+          <a class="result__snippet">A <classic> show</a>
         </div>
         "#;
         let results = parse_duckduckgo_html(html, 5);
@@ -926,8 +1091,8 @@ mod tests {
 
     #[test]
     fn test_decode_html_entities_basic() {
-        assert_eq!(decode_html_entities("a &amp; b"), "a & b");
-        assert_eq!(decode_html_entities("&lt;div&gt;"), "<div>");
+        assert_eq!(decode_html_entities("a & b"), "a & b");
+        assert_eq!(decode_html_entities("<div>"), "<div>");
         assert_eq!(decode_html_entities("it&#39;s"), "it's");
     }
 

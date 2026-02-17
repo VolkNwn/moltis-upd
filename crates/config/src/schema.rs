@@ -1111,6 +1111,7 @@ pub enum SearchProvider {
     #[default]
     Brave,
     Perplexity,
+    Serper,
 }
 
 /// Web search tool configuration.
@@ -1135,6 +1136,8 @@ pub struct WebSearchConfig {
     pub cache_ttl_minutes: u64,
     /// Perplexity-specific settings.
     pub perplexity: PerplexityConfig,
+    /// Serper.dev-specific settings.
+    pub serper: SerperConfig,
 }
 
 impl Default for WebSearchConfig {
@@ -1147,6 +1150,7 @@ impl Default for WebSearchConfig {
             timeout_seconds: 30,
             cache_ttl_minutes: 15,
             perplexity: PerplexityConfig::default(),
+            serper: SerperConfig::default(),
         }
     }
 }
@@ -1166,6 +1170,21 @@ pub struct PerplexityConfig {
     pub base_url: Option<String>,
     /// Model to use.
     pub model: Option<String>,
+}
+
+/// Serper.dev search provider configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SerperConfig {
+    /// API key (overrides `SERPER_API_KEY` env var).
+    #[serde(
+        default,
+        serialize_with = "serialize_option_secret",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub api_key: Option<Secret<String>>,
+    /// Base URL override. Defaults to "https://google.serper.dev".
+    pub base_url: Option<String>,
 }
 
 /// Web fetch tool configuration.

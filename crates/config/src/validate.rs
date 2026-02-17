@@ -148,6 +148,13 @@ fn build_schema_map() -> KnownKeys {
         ]))
     };
 
+    let serper = || {
+        Struct(HashMap::from([
+            ("api_key", Leaf),
+            ("base_url", Leaf),
+        ]))
+    };
+
     let web_search = || {
         Struct(HashMap::from([
             ("enabled", Leaf),
@@ -157,6 +164,7 @@ fn build_schema_map() -> KnownKeys {
             ("timeout_seconds", Leaf),
             ("cache_ttl_minutes", Leaf),
             ("perplexity", perplexity()),
+            ("serper", serper()),
         ]))
     };
 
