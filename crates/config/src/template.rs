@@ -322,7 +322,7 @@ deny = []                         # Tools to always deny (e.g., ["browser"])
 
 [tools.web.search]
 enabled = true                    # Enable web search tool
-provider = "brave"                # Search provider: "brave" or "perplexity"
+provider = "brave"                # Search provider: "brave", "perplexity", or "serper"
 max_results = 5                   # Number of results to return (1-10)
 timeout_seconds = 30              # HTTP request timeout
 cache_ttl_minutes = 15            # Cache results for this many minutes (0 = no cache)
@@ -333,6 +333,11 @@ cache_ttl_minutes = 15            # Cache results for this many minutes (0 = no 
 # api_key = "..."                 # Or set PERPLEXITY_API_KEY env var
 # base_url = "..."                # API base URL (auto-detected from key prefix)
 # model = "sonar"                 # Perplexity model to use
+
+# Serper (Google Search API) - https://serper.dev
+[tools.web.search.serper]
+# api_key = "..."                 # Or set SERPER_API_KEY env var
+# base_url = "https://google.serper.dev"  # API base URL (default shown)
 
 # ── Web Fetch ─────────────────────────────────────────────────────────────────
 

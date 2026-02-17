@@ -157,6 +157,47 @@ args = ["-y", "@modelcontextprotocol/server-github"]
 env = { GITHUB_TOKEN = "ghp_..." }
 ```
 
+## Web Search
+
+Moltis can search the web using Brave Search, Perplexity, or Serper. When no API key is configured, it falls back to DuckDuckGo (rate-limited).
+
+```toml
+[tools.web.search]
+enabled = true
+provider = "serper"             # "brave", "perplexity", or "serper"
+max_results = 5                 # Number of results (1-10)
+timeout_seconds = 30            # HTTP timeout
+cache_ttl_minutes = 15          # Cache duration
+
+# Serper (Google Search API) - https://serper.dev
+[tools.web.search.serper]
+api_key = "your-serper-api-key" # Or set SERPER_API_KEY env var
+
+# Brave Search API
+# [tools.web.search]
+# provider = "brave"
+# api_key = "your-brave-api-key"  # Or set BRAVE_API_KEY env var
+
+# Perplexity API
+# [tools.web.search]
+# provider = "perplexity"
+# [tools.web.search.perplexity]
+# api_key = "pplx-..."            # Or set PERPLEXITY_API_KEY env var
+# model = "sonar-pro"             # Optional: model to use
+```
+
+### Web Search Providers
+
+| Provider | API Key Env Var | Description |
+|----------|----------------|-------------|
+| `serper` | `SERPER_API_KEY` | Google Search results via Serper.dev |
+| `brave` | `BRAVE_API_KEY` | Brave Search API |
+| `perplexity` | `PERPLEXITY_API_KEY` | Perplexity AI search with citations |
+
+```admonish tip
+API keys can be set either in the config file (`tools.web.search.serper.api_key`) or via environment variables. Environment variables take precedence.
+```
+
 ## Telegram Integration
 
 ```toml
